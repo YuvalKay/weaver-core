@@ -20,6 +20,8 @@ from weaver.utils.import_tools import import_module
 parser = argparse.ArgumentParser()
 parser.add_argument('--regression-mode', action='store_true', default=False,
                     help='run in regression mode if this flag is set; otherwise run in classification mode')
+parser.add_argument('--classreg-mode', action='store_true', default=False,
+                    help='run a special task that is simultaneous regression + classification mode if this flag is set; otherwise run in classification mode')
 parser.add_argument('-c', '--data-config', type=str,
                     help='data config YAML file')
 parser.add_argument('--extra-selection', type=str, default=None,
@@ -622,7 +624,7 @@ def iotest(args, data_loader):
     _logger.info('Start running IO test')
     monitor_info = defaultdict(list)
 
-    for X, y, Z in tqdm(data_loader):
+    for X, y_cat, y_reg, Z in tqdm(data_loader):
         for k, v in Z.items():
             monitor_info[k].append(v)
     monitor_info = {k: _concat(v) for k, v in monitor_info.items()}
@@ -636,7 +638,7 @@ def iotest(args, data_loader):
             _logger.error('Error when writing output parquet file: \n' + str(e))
 
 
-def save_root(args, output_path, data_config, scores, labels, observers):
+def save_root(args, output_path, data_config, scores, labels, targets, observers):
     """
     Saves as .root
     :param data_config:
