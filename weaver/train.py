@@ -737,7 +737,7 @@ def _main(args):
         _logger.info('Running in regression mode')
         from weaver.utils.nn.tools import train_regression as train
         from weaver.utils.nn.tools import evaluate_regression as evaluate
-    if args.classreg_mode:
+    elif args.classreg_mode:
         _logger.info('Running in classification + regression mode')
         from weaver.utils.nn.tools import train_classreg as train
         from weaver.utils.nn.tools import evaluate_classreg as evaluate
