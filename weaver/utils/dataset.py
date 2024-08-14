@@ -25,7 +25,7 @@ def _finalize_inputs(table, data_config):
         if k in data_config.observer_names:
             output[k] = table[k]  # ak.Array
     # copy labels
-    for k in data_config.label_names:
+    for k in data_config.label_names+data_config.target_names:
         output[k] = ak.to_numpy(table[k])
     # transformation
     for k, params in data_config.preprocess_params.items():
@@ -99,7 +99,10 @@ def _preprocess(table, data_config, options):
         indices = _get_reweight_indices(wgts, up_sample=options['up_sample'],
                                         weight_scale=options['weight_scale'], max_resample=options['max_resample'])
     else:
-        indices = np.arange(len(table[data_config.label_names[0]]))
+        if len(data_config.label_names) > 0:
+            indices = np.arange(len(table[data_config.label_names[0]]))
+        elif len(data_config.target_names)> 0:
+            indices = np.arange(len(table[data_config.target_names[0]]))
     # shuffle
     if options['shuffle']:
         np.random.shuffle(indices)
@@ -263,11 +266,13 @@ class _SimpleIter(object):
     def get_data(self, i):
         # inputs
         X = {k: copy.deepcopy(self.table['_' + k][i]) for k in self._data_config.input_names}
-        # labels
-        y = {k: copy.deepcopy(self.table[k][i]) for k in self._data_config.label_names}
+       # labels for classification
+        y_cat = {k: self.table[k][i].copy() for k in self._data_config.label_names}
+        # target for regression
+        y_reg = {k: self.table[k][i].copy() for k in self._data_config.target_names}   
         # observers / monitor variables
         Z = {k: copy.deepcopy(self.table[k][i]) for k in self._data_config.z_variables}
-        return X, y, Z
+        return X, y_cat, y_reg, Z
 
 
 class SimpleIterDataset(torch.utils.data.IterableDataset):
