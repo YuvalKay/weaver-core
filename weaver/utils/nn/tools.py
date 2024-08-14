@@ -63,12 +63,12 @@ def train_classification(
     count = 0
     start_time = time.time()
     with tqdm.tqdm(train_loader) as tq:
-        for X, y, _ in tq:
+        for X, y_cat, _, _ in tq:
             inputs = [X[k].to(dev) for k in data_config.input_names]
-            label = y[data_config.label_names[0]].long().to(dev)
+            label = y_cat[data_config.label_names[0]].long().to(dev)
             entry_count += label.shape[0]
             try:
-                mask = y[data_config.label_names[0] + '_mask'].bool().to(dev)
+                mask = y_cat[data_config.label_names[0] + '_mask'].bool().to(dev)
             except KeyError:
                 mask = None
             opt.zero_grad()
@@ -152,19 +152,20 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     entry_count = 0
     count = 0
     scores = []
-    labels = defaultdict(list)
     labels_counts = []
+    labels = defaultdict(list)
+    targets = defaultdict(list)
     observers = defaultdict(list)
     start_time = time.time()
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
-            for X, y, Z in tq:
-                # X, y: torch.Tensor; Z: ak.Array
+            for X, y_cat, _, Z in tq:
+                # X, y_cat, _: torch.Tensor; Z: ak.Array
                 inputs = [X[k].to(dev) for k in data_config.input_names]
-                label = y[data_config.label_names[0]].long().to(dev)
+                label = y_cat, _[data_config.label_names[0]].long().to(dev)
                 entry_count += label.shape[0]
                 try:
-                    mask = y[data_config.label_names[0] + '_mask'].bool().to(dev)
+                    mask = y_cat, _[data_config.label_names[0] + '_mask'].bool().to(dev)
                 except KeyError:
                     mask = None
                 model_output = model(*inputs)
@@ -173,7 +174,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
 
                 if mask is not None:
                     mask = mask.cpu()
-                for k, v in y.items():
+                for k, v in y_cat.items():
                     labels[k].append(_flatten_label(v, mask).numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
@@ -244,7 +245,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                 for k, v in labels.items():
                     labels[k] = v.reshape((entry_count, -1))
         observers = {k: _concat(v) for k, v in observers.items()}
-        return total_correct / count, scores, labels, observers
+        return total_correct / count, scores, labels, targets, observers
 
 
 def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix']):
@@ -258,20 +259,21 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
     count = 0
     scores = []
     labels = defaultdict(list)
+    targets = defaultdict(list)
     observers = defaultdict(list)
     start_time = time.time()
     with tqdm.tqdm(test_loader) as tq:
-        for X, y, Z in tq:
-            # X, y: torch.Tensor; Z: ak.Array
+        for X, y_cat, _, Z in tq:
+            # X, y_cat: torch.Tensor; Z: ak.Array
             inputs = {k: v.numpy(force=True) for k, v in X.items()}
-            label = y[data_config.label_names[0]].numpy(force=True)
+            label = y_cat[data_config.label_names[0]].numpy(force=True)
             num_examples = label.shape[0]
             label_counter.update(label)
             score = sess.run([], inputs)[0]
             preds = score.argmax(1)
 
             scores.append(score)
-            for k, v in y.items():
+            for k, v in y_cat.items():
                 labels[k].append(v.numpy(force=True))
             for k, v in Z.items():
                 observers[k].append(v)
@@ -294,7 +296,7 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
     observers = {k: _concat(v) for k, v in observers.items()}
-    return total_correct / count, scores, labels, observers
+    return total_correct / count, scores, labels, targets, observers
 
 
 def train_regression(
@@ -311,16 +313,20 @@ def train_regression(
     count = 0
     start_time = time.time()
     with tqdm.tqdm(train_loader) as tq:
-        for X, y, _ in tq:
+        for X, _, y_reg, _ in tq:
             inputs = [X[k].to(dev) for k in data_config.input_names]
-            label = y[data_config.label_names[0]].float()
-            num_examples = label.shape[0]
-            label = label.to(dev)
+            for idx, names in enumerate(data_config.target_names):
+                if idx == 0:
+                    target = y_reg[names].float();
+                else:
+                    target = torch.column_stack((target,y_reg[names].float()))
+            num_examples = target.shape[0]
+            target = target.to(dev)
             opt.zero_grad()
             with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
                 model_output = model(*inputs)
                 preds = model_output.squeeze()
-                loss = loss_func(preds, label)
+                loss = loss_func(preds, target)
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -337,7 +343,7 @@ def train_regression(
             num_batches += 1
             count += num_examples
             total_loss += loss
-            e = preds - label
+            e = preds - target
             abs_err = e.abs().sum().item()
             sum_abs_err += abs_err
             sqr_err = e.square().sum().item()
@@ -403,32 +409,37 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
     count = 0
     scores = []
     labels = defaultdict(list)
+    targets = defaultdict(list)
     observers = defaultdict(list)
     start_time = time.time()
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
-            for X, y, Z in tq:
+            for X, _, y_reg, Z in tq:
                 # X, y: torch.Tensor; Z: ak.Array
                 inputs = [X[k].to(dev) for k in data_config.input_names]
-                label = y[data_config.label_names[0]].float()
-                num_examples = label.shape[0]
-                label = label.to(dev)
+                for idx, names in enumerate(data_config.target_names):
+                    if idx == 0:
+                        target = y_reg[names].float();
+                    else:
+                        target = torch.column_stack((target,y_reg[names].float()))
+                num_examples = target.shape[0]
+                target = target.to(dev)
                 model_output = model(*inputs)
                 preds = model_output.squeeze().float()
 
                 scores.append(preds.numpy(force=True))
-                for k, v in y.items():
-                    labels[k].append(v.numpy(force=True))
+                for k, v in y_reg.items():
+                    target[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
                         observers[k].append(v)
 
-                loss = 0 if loss_func is None else loss_func(preds, label).item()
+                loss = 0 if loss_func is None else loss_func(preds, target).item()
 
                 num_batches += 1
                 count += num_examples
                 total_loss += loss * num_examples
-                e = preds - label
+                e = preds - target
                 abs_err = e.abs().sum().item()
                 sum_abs_err += abs_err
                 sqr_err = e.square().sum().item()
@@ -467,18 +478,24 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)
 
     scores = np.concatenate(scores)
-    labels = {k: _concat(v) for k, v in labels.items()}
-    metric_results = evaluate_metrics(labels[data_config.label_names[0]], scores, eval_metrics=eval_metrics)
-    _logger.info('Evaluation metrics: \n%s', '\n'.join(
-        ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
+    targets = {k: _concat(v) for k, v in targets.items()}
+
+    for idx, (name,element) in enumerate(targets.items()):
+        if len(data_config.target_names) == 1:
+            metric_results = evaluate_metrics(element, scores, eval_metrics=eval_metrics)
+        else:
+            metric_results = evaluate_metrics(element, scores[:,idx], eval_metrics=eval_metrics)
+
+        _logger.info('Evaluation metrics: \n%s', '\n'.join(
+            ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
 
     if for_training:
         return total_loss / count
     else:
         # convert 2D labels/scores
         observers = {k: _concat(v) for k, v in observers.items()}
-        return total_loss / count, scores, labels, observers
-
+        # scores = scores.reshape(len(scores),len(data_config.target_names))
+        return total_loss / count, scores, labels, targets, observers
 
 class TensorboardHelper(object):
 
