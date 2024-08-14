@@ -415,7 +415,7 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, _, y_reg, Z in tq:
-                # X, y: torch.Tensor; Z: ak.Array
+                # X, y_reg: torch.Tensor; Z: ak.Array
                 inputs = [X[k].to(dev) for k in data_config.input_names]
                 for idx, names in enumerate(data_config.target_names):
                     if idx == 0:
@@ -429,7 +429,7 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
 
                 scores.append(preds.numpy(force=True))
                 for k, v in y_reg.items():
-                    target[k].append(v.numpy(force=True))
+                    targets[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
                         observers[k].append(v)
@@ -496,6 +496,319 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
         observers = {k: _concat(v) for k, v in observers.items()}
         # scores = scores.reshape(len(scores),len(data_config.target_names))
         return total_loss / count, scores, labels, targets, observers
+
+
+## train classification + regssion into a total loss --> best training epoch decided on the loss function
+def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None, tb_helper=None):
+
+    model.train()
+
+    data_config = train_loader.dataset.config
+
+    num_batches, total_loss, total_cat_loss, total_reg_loss, count = 0, 0, 0, 0, 0
+    label_counter = Counter()
+    total_correct, sum_abs_err, sum_sqr_err = 0, 0 ,0
+    inputs, target, label, model_output = None, None, None, None;
+    loss, loss_cat, loss_reg, pred_cat, pred_reg, residual_reg, correct = None, None, None, None, None, None, None;
+
+    start_time = time.time()
+
+    with tqdm.tqdm(train_loader) as tq:
+        for X, y_cat, y_reg, _ in tq:
+            ### input features for the model
+            inputs = [X[k].to(dev,non_blocking=True) for k in data_config.input_names]
+            ### build classification true labels (numpy argmax)
+            label  = y_cat[data_config.label_names[0]].long()
+            label  = _flatten_label(label,None)
+            label_counter.update(label.cpu().numpy().astype(dtype=np.int32))
+            label  = label.to(dev,non_blocking=True)
+            ### build regression targets
+            for idx, names in enumerate(data_config.target_names):
+                if idx == 0:
+                    target = y_reg[names].float();
+                else:
+                    target = torch.column_stack((target,y_reg[names].float()))
+            target = target.to(dev,non_blocking=True)            
+            ### Number of samples in the batch
+            num_examples = max(label.shape[0],target.shape[0]);
+            ### loss minimization
+            model.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                ### evaluate the model
+                model_output  = model(*inputs)                
+                ### check dimension of labels and target. If dimension is 1 extend them
+                if label.dim() == 1:
+                    label = label[:,None]
+                if target.dim() == 1:
+                    target = target[:,None]
+                ### erase uselss dimensions
+                label  = label.squeeze();
+                target = target.squeeze();
+                ### evaluate loss function
+                loss, loss_cat, loss_reg = loss_func(model_output,label,target);
+
+            ### back propagation
+            if grad_scaler is None:
+                loss.backward()
+                opt.step()
+            else:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(opt)
+                grad_scaler.update()
+
+            if scheduler and getattr(scheduler, '_update_per_step', True):
+                scheduler.step()
+
+            ### evaluate loss function and counters
+            loss = loss.detach().item()
+            loss_cat = loss_cat.detach().item()
+            loss_reg = loss_reg.detach().item()
+            total_loss += loss
+            total_cat_loss += loss_cat;
+            total_reg_loss += loss_reg;
+            num_batches += 1
+            count += num_examples;
+
+            ## take the classification prediction and compare with the true labels            
+            label = label.detach()
+            target = target.detach()
+            if(model_output.dim() == 1) : continue;
+            _, pred_cat = model_output[:,:len(data_config.label_value)].squeeze().max(1);
+            correct  = (pred_cat.detach() == label.detach()).sum().item()
+            total_correct += correct
+
+            ## take the regression prediction and compare with true targets
+            pred_reg = model_output[:,len(data_config.label_value):len(data_config.label_value)+len(data_config.target_value)].squeeze().float();
+            residual_reg = pred_reg.detach() - target.detach();            
+            abs_err = residual_reg.abs().sum().item();
+            sum_abs_err += abs_err;
+            sqr_err = residual_reg.square().sum().item()
+            sum_sqr_err += sqr_err
+
+            ### monitor metrics
+            tq.set_postfix({
+                'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
+                'Loss': '%.5f' % loss,
+                'AvgLoss': '%.5f' % (total_loss / num_batches),
+                'Acc': '%.5f' % (correct / num_examples),
+                'AvgAcc': '%.5f' % (total_correct / count),
+                'MSE': '%.5f' % (sqr_err / num_examples),
+                'AvgMSE': '%.5f' % (sum_sqr_err / count),
+                'MAE': '%.5f' % (abs_err / num_examples),
+                'AvgMAE': '%.5f' % (sum_abs_err / count),
+
+            })
+
+            if tb_helper:
+                tb_helper.write_scalars([
+                    ("Loss/train", loss, tb_helper.batch_train_count + num_batches),
+                    ("Acc/train", correct / num_examples, tb_helper.batch_train_count + num_batches),
+                    ("MSE/train", sqr_err / num_examples, tb_helper.batch_train_count + num_batches),
+                    ("MAE/train", abs_err / num_examples, tb_helper.batch_train_count + num_batches),
+                    ])
+                if tb_helper.custom_fn:
+                    with torch.no_grad():
+                        tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches, mode='train')
+
+            if steps_per_epoch is not None and num_batches >= steps_per_epoch:
+                break
+
+    ### training summary
+    time_diff = time.time() - start_time
+    _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
+    _logger.info('Train AvgLoss: %.5f'% (total_loss / num_batches))
+    _logger.info('Train AvgLoss Cat: %.5f'% (total_cat_loss / num_batches))
+    _logger.info('Train AvgLoss Reg: %.5f'% (total_reg_loss / num_batches))
+    _logger.info('Train AvgAcc: %.5f'%(total_correct / count))
+    _logger.info('Train AvgMSE: %.5f'%(sum_sqr_err / count))
+    _logger.info('Train AvgMAE: %.5f'%(sum_abs_err / count))
+    _logger.info('Train class distribution: \n %s', str(sorted(label_counter.items())))
+
+    if tb_helper:
+        tb_helper.write_scalars([
+            ("Loss/train (epoch)", total_loss / num_batches, epoch),
+            ("Loss Cat/train (epoch)", total_cat_loss / num_batches, epoch),
+            ("Loss Reg/train (epoch)", total_reg_loss / num_batches, epoch),
+            ("Acc/train (epoch)", total_correct / count, epoch),
+            ("MSE/train (epoch)", sum_sqr_err / count, epoch),
+            ("MAE/train (epoch)", sum_abs_err / count, epoch),
+            ])
+        if tb_helper.custom_fn:
+            with torch.no_grad():
+                tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode='train')
+        # update the batch state
+        tb_helper.batch_train_count += num_batches
+
+
+## evaluate classification + regression task
+def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None, tb_helper=None,
+                      eval_cat_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],
+                      eval_reg_metrics=['mean_squared_error', 'mean_absolute_error', 'median_absolute_error', 'mean_gamma_deviance']):
+
+    model.eval()
+
+    data_config = test_loader.dataset.config
+    label_counter = Counter()
+    total_loss, total_cat_loss, total_reg_loss, num_batches, total_correct, sum_sqr_err, sum_abs_err, entry_count, count = 0, 0, 0, 0, 0, 0, 0, 0, 0;
+    inputs, label, target,  model_output, pred_cat_output, pred_reg, loss, loss_cat, loss_reg = None, None, None, None, None , None, None, None, None;
+    scores_cat, scores_reg = [], [];
+    labels, targets, observers = defaultdict(list), defaultdict(list), defaultdict(list);
+    start_time = time.time()
+
+    with torch.no_grad():
+        with tqdm.tqdm(test_loader) as tq:
+            for X, y_cat, y_reg, Z in tq:
+                ### input features for the model
+                inputs = [X[k].to(dev,non_blocking=True) for k in data_config.input_names]
+                ### build classification true labels
+                label  = y_cat[data_config.label_names[0]].long()
+                label  = _flatten_label(label,None)
+                label_counter.update(label.cpu().numpy().astype(dtype=np.int32))
+                label  = label.to(dev,non_blocking=True)
+                ### build regression targets
+                for idx, names in enumerate(data_config.target_names):
+                    if idx == 0:
+                        target = y_reg[names].float();
+                    else:
+                        target = torch.column_stack((target,y_reg[names].float()))
+                target = target.to(dev,non_blocking=True)            
+                ### update counters
+                num_examples = max(label.shape[0],target.shape[0]);
+                entry_count += num_examples
+                ### evaluate model
+                model_output = model(*inputs)
+                ### define truth labels for classification and regression
+                for k, name in enumerate(data_config.label_names):                    
+                    labels[name].append(_flatten_label(y_cat[name],None).cpu().numpy().astype(dtype=np.int32))
+                for k, name in enumerate(data_config.target_names):
+                    targets[name].append(y_reg[name].cpu().numpy().astype(dtype=np.float32))                
+                ### observers
+                if not for_training:
+                    for k, v in Z.items():
+                        observers[k].append(v.cpu().numpy().astype(dtype=np.float32))
+                ### build classification and regression outputs
+                pred_cat_output = model_output[:,:len(data_config.label_value)].squeeze().float()
+                pred_reg        = model_output[:,len(data_config.label_value):len(data_config.label_value)+len(data_config.target_value)].squeeze().float();                
+                if pred_cat_output.shape[0] == num_examples and pred_reg.shape[0] == num_examples:
+                    _, pred_cat = pred_cat_output.max(1);
+                    scores_cat.append(torch.softmax(pred_cat_output,dim=1).cpu().numpy().astype(dtype=np.float32));
+                    scores_reg.append(pred_reg.cpu().numpy().astype(dtype=np.float32))
+                else:
+                    scores_cat.append(torch.zeros(num_examples,len(data_config.target_value)).cpu().numpy().astype(dtype=np.float32));                    
+                    if len(data_config.target_value) > 1:
+                        scores_reg.append(torch.zeros(num_examples,len(data_config.target_value)).cpu().numpy().astype(dtype=np.float32));
+                    else:
+                        scores_reg.append(torch.zeros(num_examples).cpu().numpy().astype(dtype=np.float32));                        
+
+                ### evaluate loss function
+                if loss_func != None:
+                    ### check dimension of labels and target. If dimension is 1 extend them
+                    if label.dim() == 1:
+                        label = label[:,None]
+                    if target.dim() == 1:
+                        target = target[:,None]
+                    ### true labels and true target 
+                    loss, loss_cat, loss_reg = loss_func(model_output,label,target)
+                    loss = loss.detach().item()
+                    loss_cat = loss_cat.detach().item()
+                    loss_reg = loss_reg.detach().item()
+                    ### erase useless dimensions
+                    label  = label.squeeze();
+                    target = target.squeeze();                                         
+                    total_loss += loss
+                    total_cat_loss += loss_cat
+                    total_reg_loss += loss_reg
+                else:
+                    loss,loss_cat,loss_reg = 0,0,0;
+                    total_loss += loss
+                    total_cat_loss += loss_cat
+                    total_reg_loss += loss_reg
+
+                num_batches += 1
+                count += num_examples
+
+                ### classification accuracy
+                if pred_cat_output.shape[0] == num_examples and pred_reg.shape[0] == num_examples:
+
+                    correct = (pred_cat == label).sum().item()
+                    total_correct += correct
+                    ### regression spread
+                    residual_reg = pred_reg - target;
+                    abs_err = residual_reg.abs().sum().item();
+                    sum_abs_err += abs_err;
+                    sqr_err = residual_reg.square().sum().item()
+                    sum_sqr_err += sqr_err
+
+                    ### monitor results
+                    tq.set_postfix({
+                        'Loss': '%.5f' % loss,
+                        'AvgLoss': '%.5f' % (total_loss / num_batches),
+                        'Acc': '%.5f' % (correct / num_examples),
+                        'AvgAcc': '%.5f' % (total_correct / count),
+                        'MSE': '%.5f' % (sqr_err / num_examples),
+                        'AvgMSE': '%.5f' % (sum_sqr_err / count),
+                        'MAE': '%.5f' % (abs_err / num_examples),
+                        'AvgMAE': '%.5f' % (sum_abs_err / count),                        
+                    })
+
+                if tb_helper:
+                    if tb_helper.custom_fn:
+                        with torch.no_grad():
+                            tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches,
+                                                mode='eval' if for_training else 'test')
+
+                if steps_per_epoch is not None and num_batches >= steps_per_epoch:
+                    break
+
+    time_diff = time.time() - start_time
+    _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
+    _logger.info('Evaluation class distribution: \n    %s', str(sorted(label_counter.items())))
+
+    if tb_helper:
+        tb_mode = 'eval' if for_training else 'test'
+        tb_helper.write_scalars([
+            ("Loss/%s (epoch)"%(tb_mode), total_loss / num_batches, epoch),
+            ("Loss Cat/%s (epoch)"%(tb_mode), total_cat_loss / num_batches, epoch),
+            ("Loss Reg/%s (epoch)"%(tb_mode), total_reg_loss / num_batches, epoch),
+            ("Acc/%s (epoch)"%(tb_mode), total_correct / count, epoch),
+            ("MSE/%s (epoch)"%(tb_mode), sum_sqr_err / count, epoch),
+            ("MAE/%s (epoch)"%(tb_mode), sum_abs_err / count, epoch),
+            ])
+        if tb_helper.custom_fn:
+            with torch.no_grad():
+                tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)
+
+    scores_cat = np.concatenate(scores_cat).squeeze()
+    scores_reg = np.concatenate(scores_reg).squeeze()
+    labels  = {k: _concat(v) for k, v in labels.items()}
+    targets = {k: _concat(v) for k, v in targets.items()}
+    observers = {k: _concat(v) for k, v in observers.items()}
+
+    _logger.info('Evaluation of metrics\n')
+    metric_cat_results = evaluate_metrics(labels[data_config.label_names[0]], scores_cat, eval_metrics=eval_cat_metrics)    
+    _logger.info('Evaluation Classification metrics: \n%s', '\n'.join(
+        ['    - %s: \n%s' % (k, str(v)) for k, v in metric_cat_results.items()]))
+
+    _logger.info('Evaluation of regression metrics\n')
+    for idx, (name,element) in enumerate(targets.items()):
+        if len(data_config.target_names) == 1:
+            metric_reg_results = evaluate_metrics(element, scores_reg, eval_metrics=eval_reg_metrics)
+        else:
+            metric_reg_results = evaluate_metrics(element, scores_reg[:,idx], eval_metrics=eval_reg_metrics)
+
+        _logger.info('Evaluation Regression metrics for '+name+' target: \n%s', '\n'.join(
+            ['    - %s: \n%s' % (k, str(v)) for k, v in metric_reg_results.items()]))        
+
+    if for_training:
+        gc.collect();
+        return total_loss / num_batches;
+    else:
+        if scores_reg.ndim and scores_cat.ndim: 
+            scores_reg = scores_reg.reshape(len(scores_reg),len(data_config.target_names))
+            scores = np.concatenate((scores_cat,scores_reg),axis=1)
+            return total_loss / num_batches, scores, labels, targets, observers
+        else:
+            return total_loss / num_batches, scores_reg, labels, targets, observers;
 
 class TensorboardHelper(object):
 
