@@ -265,8 +265,9 @@ def train_load(args):
     data_config = train_data.config
     train_input_names = train_data.config.input_names
     train_label_names = train_data.config.label_names
+    train_target_names = train_data.config.target_names
 
-    return train_loader, val_loader, data_config, train_input_names, train_label_names
+    return train_loader, val_loader, data_config, train_input_names, train_label_names, train_target_names
 
 
 def test_load(args):
@@ -644,16 +645,24 @@ def save_root(args, output_path, data_config, scores, labels, targets, observers
     :param data_config:
     :param scores:
     :param labels
+    :param targets
     :param observers
     :return:
     """
     import awkward as ak
     from weaver.utils.data.fileio import _write_root
     output = {}
+    print(f'data_config: {data_config}')
     if data_config.label_type == 'simple':
         for idx, label_name in enumerate(data_config.label_value):
             output[label_name] = (labels[data_config.label_names[0]] == idx)
             output['score_' + label_name] = scores[:, idx]
+    elif args.classreg_mode:
+        for idx, label_name in enumerate(data_config.label_value):
+            output[label_name] = (labels[data_config.label_names[0]] == idx)
+            output['score_' + label_name] = scores[:, idx]
+        for idx, target_name in enumerate(data_config.target_value):
+            output['score_' + target_name] = scores[:, len(data_config.label_value)+idx]
     else:
         if scores.ndim <= 2:
             output['output'] = scores
@@ -691,17 +700,19 @@ def save_root(args, output_path, data_config, scores, labels, targets, observers
             _logger.error('Error when writing output parquet file: \n' + str(e))
 
 
-def save_parquet(args, output_path, scores, labels, observers):
+def save_parquet(args, output_path, scores, labels, targets, observers):
     """
     Saves as parquet file
     :param scores:
     :param labels:
+    :param targets:
     :param observers:
     :return:
     """
     import awkward as ak
     output = {'scores': scores}
     output.update(labels)
+    output.update(targets)
     output.update(observers)
     try:
         ak.to_parquet(ak.Array(output), output_path, compression='LZ4', compression_level=4)
@@ -726,6 +737,10 @@ def _main(args):
         _logger.info('Running in regression mode')
         from weaver.utils.nn.tools import train_regression as train
         from weaver.utils.nn.tools import evaluate_regression as evaluate
+    if args.classreg_mode:
+        _logger.info('Running in classification + regression mode')
+        from weaver.utils.nn.tools import train_classreg as train
+        from weaver.utils.nn.tools import evaluate_classreg as evaluate
     else:
         _logger.info('Running in classification mode')
         from weaver.utils.nn.tools import train_classification as train
@@ -758,7 +773,7 @@ def _main(args):
 
     # load data
     if training_mode:
-        train_loader, val_loader, data_config, train_input_names, train_label_names = train_load(args)
+        train_loader, val_loader, data_config, train_input_names, train_label_names, train_target_names = train_load(args)
     else:
         test_loaders, data_config = test_load(args)
 
@@ -813,7 +828,7 @@ def _main(args):
             start_lr, end_lr, num_iter = args.lr_finder.replace(' ', '').split(',')
             from weaver.utils.lr_finder import LRFinder
             lr_finder = LRFinder(model, opt, loss_func, device=dev, input_names=train_input_names,
-                                 label_names=train_label_names)
+                                 label_names=train_label_names+train_target_names)
             lr_finder.range_test(train_loader, start_lr=float(start_lr), end_lr=float(end_lr), num_iter=int(num_iter))
             lr_finder.plot(output='lr_finder.png')  # to inspect the loss-learning rate graph
             return
@@ -890,9 +905,9 @@ def _main(args):
             if args.model_prefix.endswith('.onnx'):
                 _logger.info('Loading model %s for eval' % args.model_prefix)
                 from weaver.utils.nn.tools import evaluate_onnx
-                test_metric, scores, labels, observers = evaluate_onnx(args.model_prefix, test_loader)
+                test_metric, scores, labels, targets, observers = evaluate_onnx(args.model_prefix, test_loader)
             else:
-                test_metric, scores, labels, observers = evaluate(
+                test_metric, scores, labels, targets, observers = evaluate(
                     model, test_loader, dev, epoch=None, for_training=False, tb_helper=tb)
             _logger.info('Test metric %.5f' % test_metric, color='bold')
             del test_loader
@@ -911,9 +926,9 @@ def _main(args):
                     base, ext = os.path.splitext(predict_output)
                     output_path = base + '_' + name + ext
                 if output_path.endswith('.root'):
-                    save_root(args, output_path, data_config, scores, labels, observers)
+                    save_root(args, output_path, data_config, scores, labels, targets, observers)
                 else:
-                    save_parquet(args, output_path, scores, labels, observers)
+                    save_parquet(args, output_path, scores, labels, targets, observers)
 
 
 def main():
