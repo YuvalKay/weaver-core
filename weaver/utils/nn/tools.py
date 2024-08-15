@@ -796,7 +796,6 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
             ['    - %s: \n%s' % (k, str(v)) for k, v in metric_reg_results.items()]))        
 
     if for_training:
-        gc.collect();
         return total_loss / num_batches;
     else:
         if scores_reg.ndim and scores_cat.ndim: 
