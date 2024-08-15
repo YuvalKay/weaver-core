@@ -133,7 +133,7 @@ def build_sparse_tensor(uu, idx, seq_len):
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    # From https://github.com/rwightman/pytorch-image-models/blob/18ec173f95aa220af753358bf860b16b6691edb2/timm/layers/weight_init.py#L8
+    # From https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
     r"""Fills the input Tensor with values drawn from a truncated
     normal distribution. The values are effectively drawn from the
     normal distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`
@@ -258,7 +258,8 @@ class Embed(nn.Module):
 class PairEmbed(nn.Module):
     def __init__(
             self, pairwise_lv_dim, pairwise_input_dim, dims,
-            remove_self_pair=False, use_pre_activation_pair=True, mode='sum',
+            remove_self_pair=False, mode='sum',
+            use_pre_norm_pair=True, return_tril=False,
             normalize_input=True, activation='gelu', eps=1e-8,
             for_onnx=False):
         super().__init__()
@@ -268,22 +269,27 @@ class PairEmbed(nn.Module):
         self.is_symmetric = (pairwise_lv_dim <= 5) and (pairwise_input_dim == 0)
         self.remove_self_pair = remove_self_pair
         self.mode = mode
+        self.return_tril = return_tril
         self.for_onnx = for_onnx
         self.pairwise_lv_fts = partial(pairwise_lv_fts, num_outputs=pairwise_lv_dim, eps=eps, for_onnx=for_onnx)
         self.out_dim = dims[-1]
 
+        if use_pre_norm_pair:
+            normalize_input = False
         if self.mode == 'concat':
             input_dim = pairwise_lv_dim + pairwise_input_dim
             module_list = [nn.BatchNorm1d(input_dim)] if normalize_input else []
             for dim in dims:
                 module_list.extend([
+                    nn.BatchNorm1d(input_dim),
+                    nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                    nn.Conv1d(input_dim, dim, 1),
+                ] if use_pre_norm_pair else [
                     nn.Conv1d(input_dim, dim, 1),
                     nn.BatchNorm1d(dim),
                     nn.GELU() if activation == 'gelu' else nn.ReLU(),
                 ])
                 input_dim = dim
-            if use_pre_activation_pair:
-                module_list = module_list[:-1]
             self.embed = nn.Sequential(*module_list)
         elif self.mode == 'sum':
             if pairwise_lv_dim > 0:
@@ -291,13 +297,15 @@ class PairEmbed(nn.Module):
                 module_list = [nn.BatchNorm1d(input_dim)] if normalize_input else []
                 for dim in dims:
                     module_list.extend([
+                        nn.BatchNorm1d(input_dim),
+                        nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                        nn.Conv1d(input_dim, dim, 1),
+                    ] if use_pre_norm_pair else [
                         nn.Conv1d(input_dim, dim, 1),
                         nn.BatchNorm1d(dim),
                         nn.GELU() if activation == 'gelu' else nn.ReLU(),
                     ])
                     input_dim = dim
-                if use_pre_activation_pair:
-                    module_list = module_list[:-1]
                 self.embed = nn.Sequential(*module_list)
 
             if pairwise_input_dim > 0:
@@ -305,13 +313,15 @@ class PairEmbed(nn.Module):
                 module_list = [nn.BatchNorm1d(input_dim)] if normalize_input else []
                 for dim in dims:
                     module_list.extend([
+                        nn.BatchNorm1d(input_dim),
+                        nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                        nn.Conv1d(input_dim, dim, 1),
+                    ] if use_pre_norm_pair else [
                         nn.Conv1d(input_dim, dim, 1),
                         nn.BatchNorm1d(dim),
                         nn.GELU() if activation == 'gelu' else nn.ReLU(),
                     ])
                     input_dim = dim
-                if use_pre_activation_pair:
-                    module_list = module_list[:-1]
                 self.fts_embed = nn.Sequential(*module_list)
         else:
             raise RuntimeError('`mode` can only be `sum` or `concat`')
@@ -364,6 +374,8 @@ class PairEmbed(nn.Module):
                 elements = self.embed(x) + self.fts_embed(uu)
 
         if self.is_symmetric and not self.for_onnx:
+            if self.return_tril:
+                return elements, (i, j)
             y = torch.zeros(batch_size, self.out_dim, seq_len, seq_len, dtype=elements.dtype, device=elements.device)
             y[:, :, i, j] = elements
             y[:, :, j, i] = elements
@@ -374,6 +386,7 @@ class PairEmbed(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=4,
+                 pair_rescale=False, pair_dropout=0,
                  dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                  add_bias_kv=False, activation='gelu',
                  scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True):
@@ -401,10 +414,20 @@ class Block(nn.Module):
         self.post_fc_norm = nn.LayerNorm(self.ffn_dim) if scale_fc else None
         self.fc2 = nn.Linear(self.ffn_dim, embed_dim)
 
+        if pair_rescale:
+            self.p_embed = nn.Sequential(
+                nn.BatchNorm1d(num_heads),
+                nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                nn.Dropout(pair_dropout),
+                nn.Conv1d(num_heads, num_heads, 1),
+            )
+        else:
+            self.p_embed = None
+
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
 
-    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None):
+    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None, tril_indices=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -416,7 +439,7 @@ class Block(nn.Module):
         Returns:
             encoded output of shape `(seq_len, batch, embed_dim)`
         """
-
+        out_attn_mask = attn_mask
         if x_cls is not None:
             with torch.no_grad():
                 # prepend one element for x_cls: -> (batch, 1+seq_len)
@@ -429,6 +452,18 @@ class Block(nn.Module):
         else:
             residual = x
             x = self.pre_attn_norm(x)
+            if self.p_embed is not None and attn_mask is not None:
+                attn_mask = attn_mask + self.p_embed(attn_mask)
+                out_attn_mask = attn_mask
+                if tril_indices is not None:
+                    seq_len, batch_size, _ = x.size()
+                    i, j = tril_indices
+                    y = torch.zeros(batch_size, self.num_heads, seq_len, seq_len,
+                                    dtype=attn_mask.dtype, device=attn_mask.device)
+                    y[:, :, i, j] = attn_mask
+                    y[:, :, j, i] = attn_mask
+                    attn_mask = y
+                attn_mask = attn_mask.view(-1, seq_len, seq_len)  # (batch_size*num_heads, seq_len, seq_len)
             x = self.attn(x, x, x, key_padding_mask=padding_mask,
                           attn_mask=attn_mask)[0]  # (seq_len, batch, embed_dim)
 
@@ -454,19 +489,20 @@ class Block(nn.Module):
             residual = torch.mul(self.w_resid, residual)
         x += residual
 
-        return x
+        return x, out_attn_mask
 
 
 class ParticleTransformer(nn.Module):
 
     def __init__(self,
                  input_dim,
-                 num_classes=None,
+                 num_classes,
+                 num_targets,
                  # network configurations
                  pair_input_dim=4,
                  pair_extra_dim=0,
                  remove_self_pair=False,
-                 use_pre_activation_pair=True,
+                 use_pre_norm_pair=True,
                  embed_dims=[128, 512, 128],
                  pair_embed_dims=[64, 64, 64],
                  num_heads=8,
@@ -482,6 +518,8 @@ class ParticleTransformer(nn.Module):
                  use_amp=False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
+        self.num_classes = num_classes;
+        self.num_targets = num_targets;
 
         self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
         self.for_inference = for_inference
@@ -489,6 +527,7 @@ class ParticleTransformer(nn.Module):
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
+                           pair_rescale=False, pair_dropout=0,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                            add_bias_kv=False, activation=activation,
                            scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True)
@@ -504,10 +543,11 @@ class ParticleTransformer(nn.Module):
         _logger.info('cfg_cls_block: %s' % str(cfg_cls_block))
 
         self.pair_extra_dim = pair_extra_dim
+        self.pair_rescale = cfg_block['pair_rescale']
         self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
         self.pair_embed = PairEmbed(
-            pair_input_dim, pair_extra_dim, pair_embed_dims + [cfg_block['num_heads']],
-            remove_self_pair=remove_self_pair, use_pre_activation_pair=use_pre_activation_pair,
+            pair_input_dim, pair_extra_dim, pair_embed_dims + [cfg_block['num_heads']], remove_self_pair=remove_self_pair,
+            use_pre_norm_pair=(use_pre_norm_pair or self.pair_rescale), return_tril=self.pair_rescale,
             for_onnx=for_inference) if pair_embed_dims is not None and pair_input_dim + pair_extra_dim > 0 else None
         self.blocks = nn.ModuleList([Block(**cfg_block) for _ in range(num_layers)])
         self.cls_blocks = nn.ModuleList([Block(**cfg_cls_block) for _ in range(num_cls_layers)])
@@ -519,7 +559,7 @@ class ParticleTransformer(nn.Module):
             for out_dim, drop_rate in fc_params:
                 fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
                 in_dim = out_dim
-            fcs.append(nn.Linear(in_dim, num_classes))
+            fcs.append(nn.Linear(in_dim, num_classes+num_targets))
             self.fc = nn.Sequential(*fcs)
         else:
             self.fc = None
@@ -550,17 +590,22 @@ class ParticleTransformer(nn.Module):
             # input embedding
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
             attn_mask = None
+            tril_indices = None
             if (v is not None or uu is not None) and self.pair_embed is not None:
-                attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))  # (N*num_heads, P, P)
+                if self.pair_rescale:
+                    attn_mask, tril_indices = self.pair_embed(v, uu)
+                else:
+                    attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))  # (N*num_heads, P, P)
 
             # transform
             for block in self.blocks:
-                x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
+                x, attn_mask = block(x, x_cls=None, padding_mask=padding_mask,
+                                     attn_mask=attn_mask, tril_indices=tril_indices)
 
             # extract class token
             cls_tokens = self.cls_token.expand(1, x.size(1), -1)  # (1, N, C)
             for block in self.cls_blocks:
-                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
+                cls_tokens, _ = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
 
             x_cls = self.norm(cls_tokens).squeeze(0)
 
@@ -569,7 +614,12 @@ class ParticleTransformer(nn.Module):
                 return x_cls
             output = self.fc(x_cls)
             if self.for_inference:
-                output = torch.softmax(output, dim=1)
+                if self.num_targets == 0 and self.num_classes != 0:
+                    output = torch.softmax(output,dim=1);
+                elif self.num_targets != 0 and self.num_classes != 0:
+                    output_class = torch.softmax(output[:,:self.num_classes],dim=1)
+                    output_reg   = output[:,self.num_classes:self.num_classes+self.num_targets];
+                    output = torch.cat((output_class,output_reg),dim=1);
             # print('output:\n', output)
             return output
 
@@ -580,11 +630,12 @@ class ParticleTransformerTagger(nn.Module):
                  pf_input_dim,
                  sv_input_dim,
                  num_classes=None,
+                 num_targets=None,
                  # network configurations
                  pair_input_dim=4,
                  pair_extra_dim=0,
                  remove_self_pair=False,
-                 use_pre_activation_pair=True,
+                 use_pre_norm_pair=True,
                  embed_dims=[128, 512, 128],
                  pair_embed_dims=[64, 64, 64],
                  num_heads=8,
@@ -611,11 +662,12 @@ class ParticleTransformerTagger(nn.Module):
 
         self.part = ParticleTransformer(input_dim=embed_dims[-1],
                                         num_classes=num_classes,
+                                        num_targets=num_targets,
                                         # network configurations
                                         pair_input_dim=pair_input_dim,
                                         pair_extra_dim=pair_extra_dim,
                                         remove_self_pair=remove_self_pair,
-                                        use_pre_activation_pair=use_pre_activation_pair,
+                                        use_pre_norm_pair=use_pre_norm_pair,
                                         embed_dims=[],
                                         pair_embed_dims=pair_embed_dims,
                                         num_heads=num_heads,
@@ -659,11 +711,12 @@ class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
                  pf_input_dim,
                  sv_input_dim,
                  num_classes=None,
+                 num_targets=None,
                  # network configurations
                  pair_input_dim=4,
                  pair_extra_dim=0,
                  remove_self_pair=False,
-                 use_pre_activation_pair=True,
+                 use_pre_norm_pair=True,
                  embed_dims=[128, 512, 128],
                  pair_embed_dims=[64, 64, 64],
                  num_heads=8,
@@ -691,11 +744,12 @@ class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
 
         self.part = ParticleTransformer(input_dim=embed_dims[-1],
                                         num_classes=num_classes,
+                                        num_targets=num_targets,
                                         # network configurations
                                         pair_input_dim=pair_input_dim,
                                         pair_extra_dim=pair_extra_dim,
                                         remove_self_pair=remove_self_pair,
-                                        use_pre_activation_pair=use_pre_activation_pair,
+                                        use_pre_norm_pair=use_pre_norm_pair,
                                         embed_dims=[],
                                         pair_embed_dims=pair_embed_dims,
                                         num_heads=num_heads,

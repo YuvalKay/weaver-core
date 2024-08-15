@@ -508,9 +508,6 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
     num_batches, total_loss, total_cat_loss, total_reg_loss, count = 0, 0, 0, 0, 0
     label_counter = Counter()
     total_correct, sum_abs_err, sum_sqr_err = 0, 0 ,0
-    inputs, target, label, model_output = None, None, None, None;
-    loss, loss_cat, loss_reg, pred_cat, pred_reg, residual_reg, correct = None, None, None, None, None, None, None;
-
     start_time = time.time()
 
     with tqdm.tqdm(train_loader) as tq:
@@ -650,7 +647,6 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
     data_config = test_loader.dataset.config
     label_counter = Counter()
     total_loss, total_cat_loss, total_reg_loss, num_batches, total_correct, sum_sqr_err, sum_abs_err, entry_count, count = 0, 0, 0, 0, 0, 0, 0, 0, 0;
-    inputs, label, target,  model_output, pred_cat_output, pred_reg, loss, loss_cat, loss_reg = None, None, None, None, None , None, None, None, None;
     scores_cat, scores_reg = [], [];
     labels, targets, observers = defaultdict(list), defaultdict(list), defaultdict(list);
     start_time = time.time()
