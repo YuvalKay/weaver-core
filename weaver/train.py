@@ -653,16 +653,16 @@ def save_root(args, output_path, data_config, scores, labels, targets, observers
     from weaver.utils.data.fileio import _write_root
     output = {}
     print(f'data_config: {data_config}')
-    if data_config.label_type == 'simple':
-        for idx, label_name in enumerate(data_config.label_value):
-            output[label_name] = (labels[data_config.label_names[0]] == idx)
-            output['score_' + label_name] = scores[:, idx]
-    elif args.classreg_mode:
+    if args.classreg_mode:
         for idx, label_name in enumerate(data_config.label_value):
             output[label_name] = (labels[data_config.label_names[0]] == idx)
             output['score_' + label_name] = scores[:, idx]
         for idx, target_name in enumerate(data_config.target_value):
             output['score_' + target_name] = scores[:, len(data_config.label_value)+idx]
+    elif data_config.label_type == 'simple':
+        for idx, label_name in enumerate(data_config.label_value):
+            output[label_name] = (labels[data_config.label_names[0]] == idx)
+            output['score_' + label_name] = scores[:, idx]
     else:
         if scores.ndim <= 2:
             output['output'] = scores
@@ -680,6 +680,20 @@ def save_root(args, output_path, data_config, scores, labels, targets, observers
             output['output'] = scores
     output.update(labels)
     output.update(observers)
+
+    for k, v in labels.items():
+        if k == data_config.label_names[0]:
+            continue
+        if v.ndim > 1:
+            _logger.warning('Ignoring %s, not a 1d array.', k)
+            continue
+        output[k] = v
+
+    for k, v in targets.items():
+        if v.ndim > 1:
+            _logger.warning('Ignoring %s, not a 1d array.', k)
+            continue
+        output[k] = v
 
     try:
         _write_root(output_path, ak.Array(output))
@@ -834,7 +848,7 @@ def _main(args):
             return
 
         # training loop
-        best_valid_metric = np.inf if args.regression_mode else 0
+        best_val_metric = np.inf if "reg" in args.weaver_mode else 0
         grad_scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
         for epoch in range(args.num_epochs):
             if args.load_epoch is not None:
@@ -912,7 +926,7 @@ def _main(args):
             _logger.info('Test metric %.5f' % test_metric, color='bold')
             del test_loader
 
-            if args.predict_output:
+            if args.predict_output and scores.ndim:
                 if not os.path.dirname(args.predict_output):
                     predict_output = os.path.join(
                         os.path.dirname(args.model_prefix),
