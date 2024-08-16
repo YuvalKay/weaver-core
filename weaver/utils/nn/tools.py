@@ -545,6 +545,7 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
                 loss, loss_cat, loss_reg = loss_func(model_output,label,target);
 
             ### back propagation
+            opt.zero_grad()
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
