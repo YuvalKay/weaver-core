@@ -614,11 +614,11 @@ class ParticleTransformer(nn.Module):
                 return x_cls
             output = self.fc(x_cls)
             if self.for_inference:
-                if self.num_targets == 0 and self.num_classes != 0:
-                    output = torch.softmax(output,dim=1);
-                elif self.num_targets != 0 and self.num_classes != 0:
-                    output_class = torch.softmax(output[:,:self.num_classes],dim=1)
-                    output_reg   = output[:,self.num_classes:self.num_classes+self.num_targets];
+                if self.num_classes and not self.num_targets:
+                    output = torch.softmax(output, dim=1)                    
+                elif self.num_classes and self.num_targets:
+                    output_class = torch.softmax(output[:,:self.num_classes],dim=1);
+                    output_reg = output[:,self.num_classes:self.num_classes+self.num_targets];
                     output = torch.cat((output_class,output_reg),dim=1);
             # print('output:\n', output)
             return output

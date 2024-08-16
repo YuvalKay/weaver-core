@@ -848,7 +848,7 @@ def _main(args):
             return
 
         # training loop
-        best_val_metric = np.inf if "reg" in args.weaver_mode else 0
+        best_val_metric = np.inf if args.classreg_mode or args.regression_mode else 0
         grad_scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
         for epoch in range(args.num_epochs):
             if args.load_epoch is not None:
@@ -873,9 +873,8 @@ def _main(args):
             _logger.info('Epoch #%d validating' % epoch)
             valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func,
                                     steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
-            is_best_epoch = (
-                valid_metric < best_valid_metric) if args.regression_mode else(
-                valid_metric > best_valid_metric)
+            is_best_epoch = (val_metric < best_val_metric) if args.regression_mode or args.classreg_mode else(val_metric > best_val_metric)
+            
             if is_best_epoch:
                 best_valid_metric = valid_metric
                 if args.model_prefix and (args.backend is None or local_rank == 0):

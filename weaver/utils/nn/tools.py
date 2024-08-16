@@ -485,11 +485,17 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
 
     model.train()
 
+    torch.backends.cudnn.benchmark = True;
+    torch.backends.cudnn.enabled = True;
+
     data_config = train_loader.dataset.config
 
     num_batches, total_loss, total_cat_loss, total_reg_loss, count = 0, 0, 0, 0, 0
     label_counter = Counter()
     total_correct, sum_abs_err, sum_sqr_err = 0, 0 ,0
+    inputs, target, label, model_output = None, None, None, None;
+    loss, loss_cat, loss_reg, pred_cat, pred_reg, residual_reg, correct = None, None, None, None, None, None, None;
+
     start_time = time.time()
 
     with tqdm.tqdm(train_loader) as tq:
@@ -527,7 +533,6 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
                 loss, loss_cat, loss_reg = loss_func(model_output,label,target);
 
             ### back propagation
-            # opt.zero_grad()
             if grad_scaler is None:
                 loss.backward()
                 opt.step()
@@ -548,7 +553,7 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
             total_reg_loss += loss_reg;
             num_batches += 1
             count += num_examples;
-
+            
             ## take the classification prediction and compare with the true labels            
             label = label.detach()
             target = target.detach()
@@ -576,7 +581,6 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
                 'AvgMSE': '%.5f' % (sum_sqr_err / count),
                 'MAE': '%.5f' % (abs_err / num_examples),
                 'AvgMAE': '%.5f' % (sum_abs_err / count),
-
             })
 
             if tb_helper:
@@ -619,6 +623,7 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
         # update the batch state
         tb_helper.batch_train_count += num_batches
 
+    torch.cuda.empty_cache()
 
 ## evaluate classification + regression task
 def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None, tb_helper=None,
@@ -627,13 +632,10 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
 
     model.eval()
 
-    print('Hello!')
-
     if for_training:
         torch.backends.cudnn.benchmark = True;
         torch.backends.cudnn.enabled = True;
     else:
-        # convert 2D labels/scores
         torch.backends.cudnn.benchmark = False;
         torch.backends.cudnn.enabled = False;
 
@@ -645,9 +647,6 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
     labels, targets, observers = defaultdict(list), defaultdict(list), defaultdict(list);
     start_time = time.time()
 
-    num_labels  = len(data_config.label_value);
-    num_targets = len(data_config.target_value);
-
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y_cat, y_reg, Z in tq:
@@ -657,18 +656,19 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                 label  = y_cat[data_config.label_names[0]].long()
                 label  = _flatten_label(label,None)
                 label_counter.update(label.cpu().numpy().astype(dtype=np.int32))
+                label  = label.to(dev,non_blocking=True)
                 ### build regression targets
                 for idx, names in enumerate(data_config.target_names):
                     if idx == 0:
                         target = y_reg[names].float();
                     else:
                         target = torch.column_stack((target,y_reg[names].float()))
+                target = target.to(dev,non_blocking=True)            
                 ### update counters
                 num_examples = max(label.shape[0],target.shape[0]);
                 entry_count += num_examples
-                ### send to device
-                label  = label.to(dev,non_blocking=True)                
-                target = target.to(dev,non_blocking=True)            
+                ### evaluate model
+                model_output = model(*inputs)
                 ### define truth labels for classification and regression
                 for k, name in enumerate(data_config.label_names):                    
                     labels[name].append(_flatten_label(y_cat[name],None).cpu().numpy().astype(dtype=np.int32))
@@ -677,39 +677,36 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                 ### observers
                 if not for_training:
                     for k, v in Z.items():
-                        if v.cpu().numpy().dtype in (np.int16, np.int32, np.int64):
-                            observers[k].append(v.cpu().numpy().astype(dtype=np.int32))
-                        else:
-                            observers[k].append(v.cpu().numpy().astype(dtype=np.float32))
-
-                ### evaluate model
-                model_output = model(*inputs)
+                        observers[k].append(v.cpu().numpy().astype(dtype=np.float32))
                 ### build classification and regression outputs
-                model_output_cat = model_output[:,:num_labels];
-                model_output_reg = model_output[:,num_labels:num_labels+num_targets];
-                model_output_cat = _flatten_preds(model_output_cat,None)
-                model_output_cat = model_output_cat.squeeze().float();
-                model_output_reg = model_output_reg.squeeze().float();
-                label  = label.squeeze();
-                target = target.squeeze();
-                ### save scores
-                if model_output_cat.shape[0] == num_examples and model_output_reg.shape[0] == num_examples:
-                    scores_cat.append(torch.softmax(model_output_cat,dim=1).cpu().numpy().astype(dtype=np.float32));
-                    scores_reg.append(model_output_reg.cpu().numpy().astype(dtype=np.float32))
+                pred_cat_output = model_output[:,:len(data_config.label_value)].squeeze().float()
+                pred_reg        = model_output[:,len(data_config.label_value):len(data_config.label_value)+len(data_config.target_value)].squeeze().float();                
+                if pred_cat_output.shape[0] == num_examples and pred_reg.shape[0] == num_examples:
+                    _, pred_cat = pred_cat_output.max(1);
+                    scores_cat.append(torch.softmax(pred_cat_output,dim=1).cpu().numpy().astype(dtype=np.float32));
+                    scores_reg.append(pred_reg.cpu().numpy().astype(dtype=np.float32))
                 else:
-                    scores_cat.append(torch.zeros(num_examples,num_labels).cpu().numpy().astype(dtype=np.float32));
-                    if num_targets > 1:
-                        scores_reg.append(torch.zeros(num_examples,num_targets).cpu().numpy().astype(dtype=np.float32));
+                    scores_cat.append(torch.zeros(num_examples,len(data_config.target_value)).cpu().numpy().astype(dtype=np.float32));                    
+                    if len(data_config.target_value) > 1:
+                        scores_reg.append(torch.zeros(num_examples,len(data_config.target_value)).cpu().numpy().astype(dtype=np.float32));
                     else:
                         scores_reg.append(torch.zeros(num_examples).cpu().numpy().astype(dtype=np.float32));                        
-
+                    
                 ### evaluate loss function
                 if loss_func != None:
+                    ### check dimension of labels and target. If dimension is 1 extend them
+                    if label.dim() == 1:
+                        label = label[:,None]
+                    if target.dim() == 1:
+                        target = target[:,None]
                     ### true labels and true target 
-                    loss, loss_cat, loss_reg = loss_func(model_output_cat,label,model_output_reg,target)
-                    loss = loss.item()
-                    loss_cat = loss_cat.item()
-                    loss_reg = loss_reg.item()
+                    loss, loss_cat, loss_reg = loss_func(model_output,label,target)
+                    loss = loss.detach().item()
+                    loss_cat = loss_cat.detach().item()
+                    loss_reg = loss_reg.detach().item()
+                    ### erase useless dimensions
+                    label  = label.squeeze();
+                    target = target.squeeze();                                         
                     total_loss += loss
                     total_cat_loss += loss_cat
                     total_reg_loss += loss_reg
@@ -723,20 +720,18 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                 count += num_examples
 
                 ### classification accuracy
-                if model_output_cat.shape[0] == num_examples and model_output_reg.shape[0] == num_examples:
-                    _,pred_cat = model_output_cat.max(1) 
-                    pred_cat = pred_cat / pred_cat[0]
+                if pred_cat_output.shape[0] == num_examples and pred_reg.shape[0] == num_examples:
+
                     correct = (pred_cat == label).sum().item()
                     total_correct += correct
                     ### regression spread
-                    pred_reg = model_output_reg.float()
                     residual_reg = pred_reg - target;
                     abs_err = residual_reg.abs().sum().item();
                     sum_abs_err += abs_err;
                     sqr_err = residual_reg.square().sum().item()
                     sum_sqr_err += sqr_err
 
-                    ## monitor results
+                    ### monitor results
                     tq.set_postfix({
                         'Loss': '%.5f' % loss,
                         'AvgLoss': '%.5f' % (total_loss / num_batches),
@@ -781,10 +776,7 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
     targets = {k: _concat(v) for k, v in targets.items()}
     observers = {k: _concat(v) for k, v in observers.items()}
 
-    print(scores_cat)
-
     _logger.info('Evaluation of metrics\n')
-
     metric_cat_results = evaluate_metrics(labels[data_config.label_names[0]], scores_cat, eval_metrics=eval_cat_metrics)    
     _logger.info('Evaluation Classification metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_cat_results.items()]))
