@@ -871,18 +871,17 @@ def _main(args):
             #     save_checkpoint()
 
             _logger.info('Epoch #%d validating' % epoch)
-            valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func,
-                                    steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
+            val_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func, steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
             is_best_epoch = (val_metric < best_val_metric) if args.regression_mode or args.classreg_mode else(val_metric > best_val_metric)
-            
+
             if is_best_epoch:
-                best_valid_metric = valid_metric
+                best_val_metric = val_metric
                 if args.model_prefix and (args.backend is None or local_rank == 0):
                     shutil.copy2(args.model_prefix + '_epoch-%d_state.pt' %
                                  epoch, args.model_prefix + '_best_epoch_state.pt')
                     # torch.save(model, args.model_prefix + '_best_epoch_full.pt')
             _logger.info('Epoch #%d: Current validation metric: %.5f (best: %.5f)' %
-                         (epoch, valid_metric, best_valid_metric), color='bold')
+                         (epoch, val_metric, best_val_metric), color='bold')
 
     if args.data_test:
         if args.backend is not None and local_rank != 0:
@@ -971,7 +970,7 @@ def main():
         if len(args.network_option):
             model_name = model_name + "_" + hashlib.md5(str(args.network_option).encode('utf-8')).hexdigest()
         model_name += '_{optim}_lr{lr}_batch{batch}'.format(lr=args.start_lr,
-                                                            optim=args.optimizer, batch=args.batch_size)
+        optim=args.optimizer, batch=args.batch_size)
         args._auto_model_name = model_name
         args.model_prefix = args.model_prefix.replace('{auto}', model_name)
         args.log = args.log.replace('{auto}', model_name)
