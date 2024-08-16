@@ -206,9 +206,9 @@ class DataConfig(object):
         for names in self.input_dicts.values():
             self.register(names)
         # labels
-        self.keep_branches.update(self.label_names)
+        self.register(self.label_names)
         # targets
-        self.keep_branches.update(self.target_names)
+        self.register(self.target_names)
         # observers
         self.register(self.observer_names, to='test')
         # monitor variables
