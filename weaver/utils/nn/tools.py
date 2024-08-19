@@ -522,12 +522,19 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
             inputs = [X[k].to(dev) for k in data_config.input_names]
             ### build classification true labels (numpy argmax)
             label  = y_cat[data_config.label_names[0]].long().to(dev)
-            label_counter += label.shape[0]
+            label = _flatten_label(label,None)       
+            entry_count += label.shape[0]
+            try:
+                mask = y_cat[data_config.label_names[0] + '_mask'].bool().to(dev)
+            except KeyError:
+                mask = None
             ### build regression targets
-            target = y[data_config.label_names[0]].float()
-            target = target.to(dev)          
+            target = y_reg[data_config.target_names[0]].float()       
             ### Number of samples in the batch
             num_examples = max(label.shape[0],target.shape[0]);
+            ### Send to device
+            label  = label.to(dev,non_blocking=True)
+            target = target.to(dev,non_blocking=True) 
             ### loss minimization
             opt.zero_grad()
             with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
@@ -538,8 +545,8 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
                 logits, label, _ = _flatten_preds(model_output_cat, label=label, mask=mask)
                 logits = model_output_cat.squeeze().float();
                 model_output_reg = model_output_reg.squeeze().float();
-                label = label.squeeze().float();
-                target = target.squeeze().float();
+                label = label.squeeze();
+                target = target.squeeze();
                 ### evaluate loss function
                 loss, loss_cat, loss_reg = loss_func(logits,label,model_output_reg,target);
 
