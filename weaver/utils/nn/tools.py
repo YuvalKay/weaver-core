@@ -511,44 +511,37 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
     num_batches, total_loss, total_cat_loss, total_reg_loss, count = 0, 0, 0, 0, 0
     label_counter = Counter()
     total_correct, sum_abs_err, sum_sqr_err = 0, 0 ,0
-    inputs, target, label, model_output = None, None, None, None;
-    loss, loss_cat, loss_reg, pred_cat, pred_reg, residual_reg, correct = None, None, None, None, None, None, None;
-
     start_time = time.time()
+
+    num_labels  = len(data_config.label_value);
+    num_targets = len(data_config.target_value);
 
     with tqdm.tqdm(train_loader) as tq:
         for X, y_cat, y_reg, _ in tq:
             ### input features for the model
-            inputs = [X[k].to(dev,non_blocking=True) for k in data_config.input_names]
+            inputs = [X[k].to(dev) for k in data_config.input_names]
             ### build classification true labels (numpy argmax)
-            label  = y_cat[data_config.label_names[0]].long()
-            label  = _flatten_label(label,None)
-            label_counter.update(label.cpu().numpy().astype(dtype=np.int32))
-            label  = label.to(dev,non_blocking=True)
+            label  = y_cat[data_config.label_names[0]].long().to(dev)
+            label_counter += label.shape[0]
             ### build regression targets
-            for idx, names in enumerate(data_config.target_names):
-                if idx == 0:
-                    target = y_reg[names].float();
-                else:
-                    target = torch.column_stack((target,y_reg[names].float()))
-            target = target.to(dev,non_blocking=True)            
+            target = y[data_config.label_names[0]].float()
+            target = target.to(dev)          
             ### Number of samples in the batch
             num_examples = max(label.shape[0],target.shape[0]);
             ### loss minimization
-            model.zero_grad(set_to_none=True)
+            opt.zero_grad()
             with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
                 ### evaluate the model
-                model_output  = model(*inputs)                
-                ### check dimension of labels and target. If dimension is 1 extend them
-                if label.dim() == 1:
-                    label = label[:,None]
-                if target.dim() == 1:
-                    target = target[:,None]
-                ### erase uselss dimensions
-                label  = label.squeeze();
-                target = target.squeeze();
+                model_output  = model(*inputs)
+                model_output_cat = model_output[:,:num_labels];
+                model_output_reg = model_output[:,num_labels:num_labels+num_targets];         
+                logits, label, _ = _flatten_preds(model_output_cat, label=label, mask=mask)
+                logits = model_output_cat.squeeze().float();
+                model_output_reg = model_output_reg.squeeze().float();
+                label = label.squeeze().float();
+                target = target.squeeze().float();
                 ### evaluate loss function
-                loss, loss_cat, loss_reg = loss_func(model_output,label,target);
+                loss, loss_cat, loss_reg = loss_func(logits,label,model_output_reg,target);
 
             ### back propagation
             if grad_scaler is None:
@@ -575,14 +568,13 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
             ## take the classification prediction and compare with the true labels            
             label = label.detach()
             target = target.detach()
-            if(model_output.dim() == 1) : continue;
-            _, pred_cat = model_output[:,:len(data_config.label_value)].squeeze().max(1);
-            correct  = (pred_cat.detach() == label.detach()).sum().item()
+            _, pred_cat = logits.detach().max(1)
+            correct  = (pred_cat == label).sum().item()
             total_correct += correct
 
             ## take the regression prediction and compare with true targets
-            pred_reg = model_output[:,len(data_config.label_value):len(data_config.label_value)+len(data_config.target_value)].squeeze().float();
-            residual_reg = pred_reg.detach() - target.detach();            
+            pred_reg = model_output_reg.detach().float();
+            residual_reg = pred_reg - target;            
             abs_err = residual_reg.abs().sum().item();
             sum_abs_err += abs_err;
             sqr_err = residual_reg.square().sum().item()
