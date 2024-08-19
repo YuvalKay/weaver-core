@@ -508,7 +508,7 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
 
     data_config = train_loader.dataset.config
 
-    num_batches, total_loss, total_cat_loss, total_reg_loss, count = 0, 0, 0, 0, 0
+    num_batches, total_loss, total_cat_loss, total_reg_loss, entry_count, count = 0, 0, 0, 0, 0, 0
     label_counter = Counter()
     total_correct, sum_abs_err, sum_sqr_err = 0, 0 ,0
     start_time = time.time()
@@ -569,6 +569,7 @@ def train_classreg(model, loss_func, opt, scheduler, train_loader, dev, epoch, s
             total_loss += loss
             total_cat_loss += loss_cat;
             total_reg_loss += loss_reg;
+            label_counter.update(label.numpy(force=True))
             num_batches += 1
             count += num_examples;
             
