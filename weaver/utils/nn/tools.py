@@ -673,7 +673,7 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                 label  = y_cat[data_config.label_names[0]].long().to(dev)
                 # entry_count += label.shape[0]
                 try:
-                    mask = y[data_config.label_names[0] + '_mask'].bool().to(dev)
+                    mask = y_cat[data_config.label_names[0] + '_mask'].bool().to(dev)
                 except KeyError:
                     mask = None
                 ### build regression targets
@@ -688,11 +688,10 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                 model_output_reg = model_output[:,num_labels:num_labels+num_targets];
                 logits, label, mask = _flatten_preds(model_output_cat, label=label, mask=mask)
                 
-                
                 logits = logits.squeeze().float();
                 model_output_reg = model_output_reg.squeeze().float();
                 scores_cat.append(torch.softmax(logits.float(), dim=1).numpy(force=True)) 
-                scores.append(model_output_reg.numpy(force=True))
+                scores_reg.append(model_output_reg.numpy(force=True))
 
                 ### define truth labels for classification and regression
                 if mask is not None:
@@ -703,9 +702,7 @@ def evaluate_classreg(model, test_loader, dev, epoch, for_training=True, loss_fu
                     targets[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
-                        observers[k].append(v)
-                for k, name in enumerate(data_config.target_names):
-                    targets[name].append(y_reg[name].cpu().numpy().astype(dtype=np.float32))                
+                        observers[k].append(v)           
 
                 label_counter.update(label.numpy(force=True))
                 if not for_training and mask is not None:
